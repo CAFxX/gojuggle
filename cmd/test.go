@@ -1,102 +1,73 @@
 package main
 
 import (
+	"flag"
 	"log"
-	"math"
-	"math/rand"
-	"net"
-	"syscall"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/cafxx/gojuggle"
+	"github.com/cafxx/gojuggle/measurers"
+	"github.com/cafxx/gojuggle/throttlers"
 )
 
-type DiskSpaceMeasurer struct {
-	path string
-}
-
-func (m *DiskSpaceMeasurer) Measure() (float64, error) {
-	var res syscall.Statfs_t
-	if err := syscall.Statfs(m.path, &res); err != nil {
-		return 0, err
-	}
-	return float64(res.Blocks-res.Bavail) * float64(res.Bsize), nil
-}
-
-type UDPThrottler struct {
-	s        *net.UDPConn
-	throttle float64
-	override float64
-}
-
-func NewUDPThrottler(listener *net.UDPConn) *UDPThrottler {
-	return &UDPThrottler{s: listener, override: math.NaN()}
-}
-
-func (u *UDPThrottler) Throttle(percentage float64) {
-	u.throttle = percentage
-}
-
-func (u *UDPThrottler) Override(percentage float64) {
-	if percentage < 0 || percentage >= 1 {
-		u.override = math.NaN()
-	} else {
-		u.override = percentage
-	}
-}
-
-func (u *UDPThrottler) Run() {
-	buf := make([]byte, 1<<16)
-	for {
-		_, addr, err := u.s.ReadFromUDP(buf)
-		if err != nil {
-			log.Printf("Error reading UDP packet from addr %v: %v", addr, err)
-			continue
-		}
-
-		throttle := u.throttle
-		if !math.IsNaN(u.override) {
-			throttle = u.override
-		}
-
-		if rand.Float64() < throttle {
-			log.Printf("Ping from addr %v (%.1f%%): throttled", addr, u.throttle*100.0)
-		} else if _, err := u.s.WriteToUDP([]byte("OK"), addr); err != nil {
-			log.Printf("Ping from addr %v (%.1f%%): reply failed", addr, u.throttle*100.0)
-		} else {
-			log.Printf("Ping from addr %v (%.1f%%): replied", addr, u.throttle*100.0)
-		}
-	}
-}
+var port = flag.Int("port", 0, "UDP port to listen on")
+var path = flag.String("path", "", "Filesystem path to monitor for usage")
+var etcdEP = flag.String("etcd", "", "etcd endpoints to connect to")
+var etcdTTL = flag.Int("etcd-ttl", 60, "TTL for etcd records (seconds)")
+var etcdKeyPrefix = flag.String("etcd-key", "", "Prefix for etcd keys")
+var etcdIndex = flag.String("etcd-id", "", "Unique index for this node")
 
 func main() {
-	udpAddr, err := net.ResolveUDPAddr("udp", ":5302")
-	if err != nil {
-		log.Fatalf("Unable to resolve listening address: %v", err)
+	if *port <= 0 || *port >= 1<<16 {
+		log.Fatalf("Illegal UDP port number %d (--port)", *port)
 	}
-	udpConn, err := net.ListenUDP(udpAddr.Network(), udpAddr)
-	if err != nil {
-		log.Fatalf("Unable to listen for UDP packets on addr %v: %v", udpAddr, err)
+	if *path == "" {
+		log.Fatal("No path specified (--path)")
 	}
-	throttler := NewUDPThrottler(udpConn)
-	go throttler.Run()
-	log.Printf("UDPThrottler listening on addr %v", udpAddr)
+	fileinfo, err := os.Stat(*path)
+	if err == nil {
+		log.Fatalf("Specified path \"%s\" is invalid (--path): %v", *path, err)
+	}
+	if !fileinfo.IsDir() {
+		log.Fatalf("Specified path \"%s\" is not a directory (--path)", *path)
+	}
+	var etcd []string
+	if *etcdEP != "" {
+		etcd = strings.Split(*etcdEP, ",")
+	}
 
-	measurer := &DiskSpaceMeasurer{path: "/Users/carlo.ferraris"}
+	throttler, err := throttlers.NewUDPThrottler(*port)
+	if err != nil {
+		log.Fatalf("Error in UDPThrottler: %v", err)
+	}
+
+	go throttler.Run()
+	log.Printf("UDPThrottler listening on port %d", *port)
+
+	measurer := measurers.NewDiskSpaceMeasurer(*path)
+	log.Printf("DiskSpaceMeasurer monitoring %s", *path)
 
 	j, eCh := gojuggle.NewJuggler(gojuggle.Config{
-		EtcdEndPoints: nil,
-		EtcdKeyPrefix: "test/key",
-		EtcdTTL:       15 * time.Second,
+		EtcdEndPoints: etcd,
+		EtcdKeyPrefix: *etcdKeyPrefix,
+		EtcdIndex:     *etcdIndex,
+		EtcdTTL:       time.Duration(*etcdTTL) * time.Second,
 		Measurer:      measurer,
 		Throttler:     throttler,
 	})
+
 	select {
-	case <-eCh:
+	case err, ok := <-eCh:
+		if ok && err != nil {
+			log.Printf("Juggler error: %v", err)
+		}
 		break
 	case <-time.After(1000 * time.Second):
 		break
 	}
+	log.Print("Shutting down")
 	j.Stop()
 	<-time.After(1 * time.Second)
 }

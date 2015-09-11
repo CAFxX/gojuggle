@@ -67,16 +67,15 @@ func NewJuggler(c Config) (*Juggler, chan error) {
 		eCh:          make(chan error),
 		etcdLocalKey: "/" + c.EtcdKeyPrefix + "/" + c.EtcdIndex,
 	}
-	if j.conf.Measurer != nil {
-		go j.sendMetrics()
-	}
 	if j.conf.Throttler != nil {
 		go func() {
-			res, err := j.etcd.Watch(j.conf.EtcdKeyPrefix, 0, true, j.rCh, j.sCh)
-			log.Printf("watch res=%v, err=%v", res, err)
+			_, err := j.etcd.Watch(j.conf.EtcdKeyPrefix, 0, true, j.rCh, j.sCh)
 			j.eCh <- err
 		}()
 		go j.receiveMetrics()
+	}
+	if j.conf.Measurer != nil {
+		go j.sendMetrics()
 	}
 	return j, j.eCh
 }
@@ -166,7 +165,10 @@ func (j *Juggler) sendMetrics() {
 			m, err := j.conf.Measurer.Measure()
 			if err == nil {
 				log.Printf("Measurer returned value %f", m)
-				j.SendMetric(m)
+				err = j.SendMetric(m)
+				if err != nil {
+					log.Printf("Failed sending metric: %v", err)
+				}
 			} else {
 				log.Printf("Measurer failed: %v", err)
 			}
